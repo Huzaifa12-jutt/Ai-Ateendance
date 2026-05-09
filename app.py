@@ -17,6 +17,7 @@ import cv2
 import threading
 import time
 import os
+import numpy as np
 import config
 
 app = Flask(__name__)
@@ -51,15 +52,63 @@ def get_employee_info(name, comp_id):
     return db.employees.find_one({"name": name, "company_id": comp_id})
 
 
+def get_company_settings(company_id):
+    """Get attendance settings for a company (working hours, grace period, etc)"""
+    company = db.companies.find_one({"_id": ObjectId(company_id)})
+    if not company:
+        return None
+    
+    settings = {
+        "working_hours_start": company.get("working_hours_start", config.WORKING_HOURS_START),
+        "working_hours_end": company.get("working_hours_end", config.WORKING_HOURS_END),
+        "grace_period_minutes": company.get("grace_period_minutes", config.GRACE_PERIOD_MINUTES),
+        "checkout_time": company.get("checkout_time", "17:00")
+    }
+    return settings
+
+
+def get_attendance_status(arrival_time, company_id):
+    """Determine attendance status (Present/Late/Absent) based on arrival time and company settings"""
+    settings = get_company_settings(company_id)
+    if not settings:
+        status = "Present"
+    else:
+        working_start = settings["working_hours_start"]
+        grace_period = settings["grace_period_minutes"]
+        
+        # Get hour and minute from arrival time
+        arrival_hour = arrival_time.hour
+        arrival_minute = arrival_time.minute
+        arrival_total_mins = arrival_hour * 60 + arrival_minute
+        
+        # Calculate expected start time in minutes
+        expected_start_mins = working_start * 60
+        grace_end_mins = expected_start_mins + grace_period
+        
+        if arrival_total_mins <= grace_end_mins:
+            status = "Present"
+        else:
+            status = "Late"
+    
+    return status
+
+
 def create_attendance_record(employee, company_id, status="Present", detection_method="camera"):
+    arrival_time = datetime.now()
+    
+    # If status not explicitly provided, calculate it based on time
+    if status == "Present":
+        status = get_attendance_status(arrival_time, company_id)
+    
     record = {
         "name": employee.get("name", "Unknown"),
         "employee_id": employee.get("employee_id", "N/A"),
         "department": employee.get("department", "N/A"),
         "company_id": company_id,
-        "time": datetime.now(),
+        "time": arrival_time,
         "status": status,
-        "detection_method": detection_method
+        "detection_method": detection_method,
+        "arrival_time_formatted": arrival_time.strftime("%H:%M:%S")
     }
     db.attendance_logs.insert_one(record)
     return record
@@ -96,13 +145,21 @@ def camera_recognition_thread(company_id, source):
             return
 
         print(f"✅ Camera opened successfully using source: {source} for company {company_id}")
+        time.sleep(2)  # Allow camera to initialize
 
+        read_fail_count = 0
         while camera_active.get(company_id, False):
             ret, frame = cap.read()
             if not ret:
-                print(f"❌ ERROR: Cannot read frame from camera source '{source}' for company {company_id}!")
-                break
+                read_fail_count += 1
+                print(f"❌ ERROR: Cannot read frame from camera source '{source}' for company {company_id}! Fail count: {read_fail_count}")
+                if read_fail_count >= 10:
+                    print(f"❌ Too many read failures, stopping camera for company {company_id}")
+                    break
+                time.sleep(0.5)  # Wait before retrying
+                continue
 
+            read_fail_count = 0  # Reset on success
             frame_count += 1
             # Skip frames for performance
             if frame_count % config.FRAME_SKIP != 0:
@@ -161,15 +218,22 @@ def camera_recognition_thread(company_id, source):
         camera_active[company_id] = False
 
 
-def gen_frames():
-    if 'company_id' not in session:
-        return
+def gen_placeholder_frame():
+    # Create a placeholder image with text
+    img = np.zeros((480, 640, 3), dtype=np.uint8)
+    cv2.putText(img, "Camera Inactive", (200, 220), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+    cv2.putText(img, "Press 'Start Recognition' to activate", (120, 260), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 200), 1)
+    ret, buffer = cv2.imencode('.jpg', img)
+    frame_bytes = buffer.tobytes()
+    while True:
+        yield (b'--frame\r\n'
+               b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
+        time.sleep(1)  # Update every second
 
-    comp_id = str(session['company_id'])
-    source = get_company_camera_source(comp_id)
+def gen_frames(source):
     cap = cv2.VideoCapture(parse_camera_source(source))
     if not cap.isOpened():
-        print(f"❌ Preview cannot open source '{source}' for company {comp_id}.")
+        print(f"❌ Preview cannot open source '{source}'.")
         return
 
     try:
@@ -190,7 +254,14 @@ def gen_frames():
 def video_feed():
     if 'company_id' not in session:
         return redirect(url_for('login'))
-    return Response(gen_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
+
+    comp_id = str(session['company_id'])
+    if not camera_active.get(comp_id, False):
+        # Return a placeholder image when camera is not active
+        return Response(gen_placeholder_frame(), mimetype='multipart/x-mixed-replace; boundary=frame')
+    
+    source = get_company_camera_source(comp_id)
+    return Response(gen_frames(source), mimetype='multipart/x-mixed-replace; boundary=frame')
 
 @app.route('/')
 def home():
@@ -205,29 +276,54 @@ def home():
         "time": {"$gte": datetime(today.year, today.month, today.day)}
     }).sort("time", -1).limit(20))
 
-    company = db.companies.find_one({"_id": ObjectId(comp_id)})
-    company_camera_source = company.get("camera_source", config.CAMERA_INDEX) if company else config.CAMERA_INDEX
-    company_camera_active = camera_active.get(comp_id, False)
-
-    # Get today's attendance count and status for each employee
+    # Get today's attendance details for each employee
     today = datetime.now().date()
     today_logs = list(db.attendance_logs.find({
         "company_id": comp_id,
         "time": {"$gte": datetime(today.year, today.month, today.day)}
     }))
 
-    present_ids = {log.get("employee_id") for log in today_logs if log.get("employee_id")}
+    # Build employee status map
+    employee_status_map = {}
+    for log in today_logs:
+        emp_id = log.get("employee_id")
+        if emp_id not in employee_status_map:
+            employee_status_map[emp_id] = log
+    
+    # Calculate statistics
     employee_status = []
+    present_count = 0
+    late_count = 0
+    absent_count = 0
+    leave_count = 0
+    
     for emp in employees:
         emp_id = emp.get("employee_id", "N/A")
-        status = "Present" if emp_id in present_ids else "Absent"
+        
+        if emp_id in employee_status_map:
+            log = employee_status_map[emp_id]
+            status = log.get("status", "Present")
+            arrival_time = log.get("arrival_time_formatted", "N/A")
+            
+            if status == "Present":
+                present_count += 1
+            elif status == "Late":
+                late_count += 1
+            
+            status_display = f"{status} ({arrival_time})"
+        else:
+            status_display = "Absent"
+            absent_count += 1
+        
         employee_status.append({
             "name": emp.get("name", "Unknown"),
             "employee_id": emp_id,
             "department": emp.get("department", "N/A"),
-            "status": status
+            "status": status_display
         })
-
+    
+    total_employees = len(employees)
+    
     # Get weekly attendance data for chart
     weekly_data = []
     for i in range(7):
@@ -244,15 +340,15 @@ def home():
         })
     weekly_data.reverse()  # Oldest to newest
 
-    present_count = len([e for e in employee_status if e["status"] == "Present"])
-    absent_count = len(employee_status) - present_count
-
-    return render_template('dashboard.html', employees=employees, logs=logs,
-                           today_count=present_count,
+    return render_template('dashboard.html', 
+                           employees=employees, 
+                           logs=logs,
+                           total_employees=total_employees,
+                           present_count=present_count,
                            absent_count=absent_count,
+                           late_count=late_count,
+                           leave_count=leave_count,
                            employee_status=employee_status,
-                           camera_active=company_camera_active,
-                           company_camera_source=company_camera_source,
                            weekly_data=weekly_data)
 def login():
     if request.method == 'POST':
@@ -279,7 +375,12 @@ def register_company():
                 "name": name,
                 "admin_email": email,
                 "password": password,
-                "camera_source": config.CAMERA_INDEX
+                "camera_source": config.CAMERA_INDEX,
+                "working_hours_start": config.WORKING_HOURS_START,
+                "working_hours_end": config.WORKING_HOURS_END,
+                "grace_period_minutes": config.GRACE_PERIOD_MINUTES,
+                "checkout_time": "17:00",
+                "created_at": datetime.now()
             })
             flash("Company registered successfully! Please login.")
             return redirect(url_for('login'))
@@ -374,7 +475,21 @@ def start_camera():
         return redirect(url_for('login'))
 
     comp_id = str(session['company_id'])
+    
+    # Get configured camera source
     camera_source = get_company_camera_source(comp_id)
+    
+    if camera_source is None:
+        flash("❌ No camera source configured! Please set up your camera in Admin Settings.")
+        return redirect(url_for('home'))
+
+    # Test if the source works
+    cap = cv2.VideoCapture(parse_camera_source(camera_source))
+    if not cap.isOpened():
+        cap.release()
+        flash(f"❌ Cannot open configured camera source '{camera_source}'! Please check your camera settings.")
+        return redirect(url_for('home'))
+    cap.release()
 
     if not camera_active.get(comp_id, False):
         try:
@@ -383,7 +498,7 @@ def start_camera():
             camera_thread.daemon = True
             camera_threads[comp_id] = camera_thread
             camera_thread.start()
-            flash(f"✅ Camera started successfully using source '{camera_source}'! Face recognition is now active.")
+            flash(f"✅ Camera started successfully using source {camera_source}! Face recognition is now active.")
             print(f"🚀 Camera recognition started for company {comp_id} with source {camera_source}")
         except Exception as e:
             camera_active[comp_id] = False
@@ -446,6 +561,7 @@ def reports():
 
     comp_id = str(session['company_id'])
     report_type = request.args.get('type', 'daily')
+    department_filter = request.args.get('department', 'all')
 
     if report_type == 'daily':
         today = datetime.now().date()
@@ -453,6 +569,7 @@ def reports():
             "company_id": comp_id,
             "time": {"$gte": datetime(today.year, today.month, today.day)}
         }).sort("time", -1))
+        title = f"Daily Attendance Report - {today.strftime('%Y-%m-%d')}"
     elif report_type == 'weekly':
         week_start = datetime.now() - timedelta(days=datetime.now().weekday())
         week_start = week_start.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -460,14 +577,28 @@ def reports():
             "company_id": comp_id,
             "time": {"$gte": week_start}
         }).sort("time", -1))
+        title = f"Weekly Attendance Report - {week_start.strftime('%Y-%m-%d')} to {datetime.now().strftime('%Y-%m-%d')}"
     elif report_type == 'monthly':
         month_start = datetime.now().replace(day=1, hour=0, minute=0, second=0, microsecond=0)
         logs = list(db.attendance_logs.find({
             "company_id": comp_id,
             "time": {"$gte": month_start}
         }).sort("time", -1))
+        title = f"Monthly Attendance Report - {datetime.now().strftime('%B %Y')}"
+    else:
+        logs = []
+        title = "Attendance Report"
+    
+    # Filter by department if specified
+    if department_filter != 'all':
+        logs = [log for log in logs if log.get('department', '') == department_filter]
+    
+    # Get all departments for filter dropdown
+    departments = sorted(set(emp.get('department', 'N/A') for emp in db.employees.find({"company_id": comp_id})))
 
-    return render_template('reports.html', logs=logs, report_type=report_type)
+    return render_template('reports.html', logs=logs, report_type=report_type, 
+                          title=title, departments=departments, selected_department=department_filter)
+
 
 @app.route('/download_report/<report_type>')
 def download_report(report_type):
@@ -475,6 +606,7 @@ def download_report(report_type):
         return redirect(url_for('login'))
 
     comp_id = str(session['company_id'])
+    department_filter = request.args.get('department', 'all')
 
     if report_type == 'daily':
         today = datetime.now().date()
@@ -498,23 +630,28 @@ def download_report(report_type):
             "time": {"$gte": month_start}
         }).sort("time", -1))
         filename = f"monthly_report_{datetime.now().strftime('%Y%m%d')}.csv"
+    else:
+        logs = []
+        filename = "attendance_report.csv"
+    
+    # Filter by department if specified
+    if department_filter != 'all':
+        logs = [log for log in logs if log.get('department', '') == department_filter]
 
     # Create CSV
     output = StringIO()
     writer = csv.writer(output)
-    writer.writerow(['Employee Name', 'Employee ID', 'Department', 'Date', 'Time', 'Status'])
+    writer.writerow(['Employee Name', 'Employee ID', 'Department', 'Date', 'Time', 'Status', 'Detection Method'])
 
     for log in logs:
-        employee = db.employees.find_one({"name": log['name'], "company_id": comp_id})
-        emp_id = employee.get('employee_id', 'N/A') if employee else 'N/A'
-        dept = employee.get('department', 'N/A') if employee else 'N/A'
         writer.writerow([
-            log['name'],
-            emp_id,
-            dept,
+            log.get('name', 'N/A'),
+            log.get('employee_id', 'N/A'),
+            log.get('department', 'N/A'),
             log['time'].strftime('%Y-%m-%d'),
-            log['time'].strftime('%H:%M:%S'),
-            log.get('status', 'Present')
+            log.get('arrival_time_formatted', log['time'].strftime('%H:%M:%S')),
+            log.get('status', 'Present'),
+            log.get('detection_method', 'camera')
         ])
 
     output.seek(0)
@@ -673,6 +810,358 @@ def test_camera():
         flash(f"❌ Camera test failed: {str(e)}")
 
     return redirect(url_for('home'))
+
+
+# ===== ADMIN SETTINGS ROUTES =====
+
+@app.route('/admin_settings', methods=['GET', 'POST'])
+def admin_settings():
+    """Admin panel for company settings"""
+    if 'company_id' not in session:
+        return redirect(url_for('login'))
+    
+    comp_id = str(session['company_id'])
+    company = db.companies.find_one({"_id": ObjectId(comp_id)})
+    
+    if request.method == 'POST':
+        working_hours_start = request.form.get('working_hours_start', config.WORKING_HOURS_START)
+        working_hours_end = request.form.get('working_hours_end', config.WORKING_HOURS_END)
+        grace_period_minutes = request.form.get('grace_period_minutes', config.GRACE_PERIOD_MINUTES)
+        checkout_time = request.form.get('checkout_time', '17:00')
+        
+        try:
+            working_hours_start = int(working_hours_start)
+            working_hours_end = int(working_hours_end)
+            grace_period_minutes = int(grace_period_minutes)
+            
+            # Validation
+            if not (0 <= working_hours_start <= 23 and 0 <= working_hours_end <= 23):
+                flash("❌ Working hours must be between 0-23!")
+                return redirect(url_for('admin_settings'))
+            
+            if working_hours_start >= working_hours_end:
+                flash("❌ Start time must be before end time!")
+                return redirect(url_for('admin_settings'))
+            
+            if grace_period_minutes < 0 or grace_period_minutes > 120:
+                flash("❌ Grace period must be between 0-120 minutes!")
+                return redirect(url_for('admin_settings'))
+            
+            # Update company settings
+            db.companies.update_one(
+                {"_id": ObjectId(comp_id)},
+                {"$set": {
+                    "working_hours_start": working_hours_start,
+                    "working_hours_end": working_hours_end,
+                    "grace_period_minutes": grace_period_minutes,
+                    "checkout_time": checkout_time
+                }}
+            )
+            
+            flash("✅ Settings updated successfully!")
+            return redirect(url_for('admin_settings'))
+            
+        except Exception as e:
+            flash(f"❌ Error updating settings: {str(e)}")
+            return redirect(url_for('admin_settings'))
+    
+    settings = get_company_settings(ObjectId(comp_id))
+    cctv_cameras = list(db.cctv_cameras.find({"company_id": comp_id}))
+    camera_source = get_company_camera_source(comp_id)
+    
+    return render_template('admin_settings.html', settings=settings, cctv_cameras=cctv_cameras, company=company, camera_source=camera_source)
+
+
+# ===== CCTV MANAGEMENT ROUTES =====
+
+@app.route('/api/add_cctv', methods=['POST'])
+def add_cctv():
+    """Add a new CCTV camera configuration"""
+    if 'company_id' not in session:
+        return jsonify({"success": False, "message": "Unauthorized"}), 401
+    
+    comp_id = str(session['company_id'])
+    
+    try:
+        data = request.json
+        
+        # Validation
+        required_fields = ['device_name', 'connection_type', 'ip_address']
+        if not all(field in data for field in required_fields):
+            return jsonify({"success": False, "message": "Missing required fields"}), 400
+        
+        if not data['device_name'].strip():
+            return jsonify({"success": False, "message": "Device name cannot be empty"}), 400
+        
+        # Check if device name already exists
+        existing = db.cctv_cameras.find_one({
+            "company_id": comp_id,
+            "device_name": data['device_name'].strip()
+        })
+        
+        if existing:
+            return jsonify({"success": False, "message": "Device name already exists"}), 400
+        
+        # Create CCTV config
+        cctv_config = {
+            "company_id": comp_id,
+            "device_name": data['device_name'].strip(),
+            "connection_type": data['connection_type'],  # RTSP, ONVIF, P2P, HTTP
+            "ip_address": data['ip_address'].strip(),
+            "port": data.get('port', '554' if data['connection_type'] == 'RTSP' else ''),
+            "username": data.get('username', ''),
+            "password": data.get('password', ''),
+            "channel_number": data.get('channel_number', '1'),
+            "resolution": data.get('resolution', '720p'),
+            "status": "inactive",
+            "created_at": datetime.now(),
+            "last_connected": None
+        }
+        
+        result = db.cctv_cameras.insert_one(cctv_config)
+        
+        if result.inserted_id:
+            return jsonify({
+                "success": True,
+                "message": "CCTV camera added successfully!",
+                "camera_id": str(result.inserted_id)
+            }), 201
+        else:
+            return jsonify({"success": False, "message": "Failed to add camera"}), 500
+            
+    except Exception as e:
+        return jsonify({"success": False, "message": str(e)}), 500
+
+
+@app.route('/api/test_cctv/<camera_id>', methods=['POST'])
+def test_cctv(camera_id):
+    """Test CCTV connection"""
+    if 'company_id' not in session:
+        return jsonify({"success": False, "message": "Unauthorized"}), 401
+    
+    comp_id = str(session['company_id'])
+    
+    try:
+        camera = db.cctv_cameras.find_one({
+            "_id": ObjectId(camera_id),
+            "company_id": comp_id
+        })
+        
+        if not camera:
+            return jsonify({"success": False, "message": "Camera not found"}), 404
+        
+        # Build connection URL based on type
+        connection_type = camera['connection_type']
+        ip_address = camera['ip_address']
+        port = camera.get('port', '554')
+        username = camera.get('username', '')
+        password = camera.get('password', '')
+        channel = camera.get('channel_number', '1')
+        
+        stream_url = None
+        if connection_type == 'RTSP':
+            if username and password:
+                stream_url = f"rtsp://{username}:{password}@{ip_address}:{port}/stream"
+            else:
+                stream_url = f"rtsp://{ip_address}:{port}/stream"
+        elif connection_type == 'HTTP':
+            stream_url = f"http://{ip_address}:{port}/stream"
+        elif connection_type == 'ONVIF':
+            stream_url = f"rtsp://{ip_address}:{port}/stream"  # ONVIF also uses RTSP
+        
+        if not stream_url:
+            return jsonify({"success": False, "message": "Unsupported connection type"}), 400
+        
+        # Test connection
+        cap = cv2.VideoCapture(stream_url)
+        if cap.isOpened():
+            ret, frame = cap.read()
+            cap.release()
+            
+            if ret:
+                # Update last_connected timestamp
+                db.cctv_cameras.update_one(
+                    {"_id": ObjectId(camera_id)},
+                    {"$set": {
+                        "status": "active",
+                        "last_connected": datetime.now()
+                    }}
+                )
+                
+                return jsonify({
+                    "success": True,
+                    "message": f"✅ {camera['device_name']} connected successfully!",
+                    "stream_url": stream_url
+                }), 200
+            else:
+                return jsonify({
+                    "success": False,
+                    "message": "Connected but cannot read frames. Check DVR/stream settings."
+                }), 200
+        else:
+            return jsonify({
+                "success": False,
+                "message": f"Cannot connect to {ip_address}:{port}. Check network and credentials."
+            }), 200
+            
+    except Exception as e:
+        return jsonify({"success": False, "message": str(e)}), 500
+
+
+@app.route('/api/delete_cctv/<camera_id>', methods=['DELETE'])
+def delete_cctv(camera_id):
+    """Delete CCTV camera configuration"""
+    if 'company_id' not in session:
+        return jsonify({"success": False, "message": "Unauthorized"}), 401
+    
+    comp_id = str(session['company_id'])
+    
+    try:
+        result = db.cctv_cameras.delete_one({
+            "_id": ObjectId(camera_id),
+            "company_id": comp_id
+        })
+        
+        if result.deleted_count > 0:
+            return jsonify({
+                "success": True,
+                "message": "CCTV camera deleted successfully!"
+            }), 200
+        else:
+            return jsonify({
+                "success": False,
+                "message": "Camera not found"
+            }), 404
+            
+    except Exception as e:
+        return jsonify({"success": False, "message": str(e)}), 500
+
+
+@app.route('/api/update_cctv/<camera_id>', methods=['PUT'])
+def update_cctv(camera_id):
+    """Update CCTV camera configuration"""
+    if 'company_id' not in session:
+        return jsonify({"success": False, "message": "Unauthorized"}), 401
+    
+    comp_id = str(session['company_id'])
+    
+    try:
+        data = request.json
+        
+        # Build update dict
+        update_data = {}
+        update_fields = ['device_name', 'connection_type', 'ip_address', 'port', 
+                         'username', 'password', 'channel_number', 'resolution']
+        
+        for field in update_fields:
+            if field in data:
+                update_data[field] = data[field]
+        
+        result = db.cctv_cameras.update_one(
+            {
+                "_id": ObjectId(camera_id),
+                "company_id": comp_id
+            },
+            {"$set": update_data}
+        )
+        
+        if result.matched_count > 0:
+            return jsonify({
+                "success": True,
+                "message": "CCTV camera updated successfully!"
+            }), 200
+        else:
+            return jsonify({
+                "success": False,
+                "message": "Camera not found"
+            }), 404
+            
+    except Exception as e:
+        return jsonify({"success": False, "message": str(e)}), 500
+
+
+@app.route('/test_laptop_camera')
+def test_laptop_camera():
+    """Simple one-click laptop camera test - marks attendance if face detected"""
+    if 'company_id' not in session:
+        return redirect(url_for('login'))
+    
+    comp_id = str(session['company_id'])
+    
+    try:
+        # Try to open laptop camera
+        cap = cv2.VideoCapture(0)
+        if not cap.isOpened():
+            flash("❌ Cannot access laptop camera! Check permissions and connections.")
+            return redirect(url_for('home'))
+        
+        # Load employee face data
+        known_encodings, known_names = load_employee_data(comp_id)
+        
+        if not known_encodings:
+            cap.release()
+            flash("⚠️ No employees registered yet! Please add employees first.")
+            return redirect(url_for('home'))
+        
+        # Try to detect face in current frame
+        ret, frame = cap.read()
+        if not ret:
+            cap.release()
+            flash("❌ Cannot read frame from camera!")
+            return redirect(url_for('home'))
+        
+        # Process frame
+        small_frame = cv2.resize(frame, (0, 0), fx=0.25, fy=0.25)
+        rgb_small_frame = cv2.cvtColor(small_frame, cv2.COLOR_BGR2RGB)
+        
+        # Detect faces
+        face_locations = face_recognition.face_locations(rgb_small_frame)
+        face_encodings = face_recognition.face_encodings(rgb_small_frame, face_locations)
+        
+        cap.release()
+        
+        if not face_encodings:
+            flash("⚠️ No face detected! Please position yourself in front of camera.")
+            return redirect(url_for('home'))
+        
+        # Compare with known faces
+        face_encoding = face_encodings[0]
+        matches = face_recognition.compare_faces(known_encodings, face_encoding, tolerance=config.FACE_TOLERANCE)
+        
+        if True not in matches:
+            flash("⚠️ Face not recognized! Please make sure you are registered.")
+            return redirect(url_for('home'))
+        
+        # Mark attendance
+        idx = matches.index(True)
+        name = known_names[idx]
+        employee_info = get_employee_info(name, comp_id)
+        
+        if not employee_info:
+            flash("⚠️ Employee not found!")
+            return redirect(url_for('home'))
+        
+        # Check if already marked today
+        today = datetime.now().date()
+        existing = db.attendance_logs.find_one({
+            "employee_id": employee_info.get("employee_id"),
+            "company_id": comp_id,
+            "time": {"$gte": datetime(today.year, today.month, today.day)}
+        })
+        
+        if existing:
+            flash(f"ℹ️ {name} already marked as {existing.get('status')} today at {existing.get('arrival_time_formatted', 'N/A')}")
+        else:
+            create_attendance_record(employee_info, comp_id, detection_method="laptop_camera")
+            status = get_attendance_status(datetime.now(), comp_id)
+            flash(f"✅ Attendance marked! {name} - {status}")
+        
+        return redirect(url_for('home'))
+        
+    except Exception as e:
+        flash(f"❌ Error: {str(e)}")
+        return redirect(url_for('home'))
+
 
 if __name__ == '__main__':
     load_employee_data()
